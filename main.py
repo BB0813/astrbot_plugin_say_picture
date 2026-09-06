@@ -150,6 +150,15 @@ class MentionSayPlugin(Star):
             role = member_info.get("role", "member")
             level = int(member_info.get("level", 0) or 0)
             title = member_info.get("title", "") or ""
+            # 调试：打印昵称/头衔码点，用于定位渲染 tofu 的确切字符
+            print(
+                f"[mention_say] name codepoints: "
+                f"{[hex(ord(c)) for c in name]!r}"
+            )
+            print(
+                f"[mention_say] title codepoints: "
+                f"{[hex(ord(c)) for c in title]!r}"
+            )
 
             image_bytes = render_chat_screenshot(
                 name=name,
