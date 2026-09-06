@@ -45,18 +45,19 @@ def set_font_dir(path: Path) -> None:
 
 EMOJI_PATTERN = re.compile(
     "["
-    "\U0001f1e6-\U0001f1ff"
-    "\U0001f300-\U0001f5ff"
-    "\U0001f600-\U0001f64f"
-    "\U0001f680-\U0001f6ff"
-    "\U0001f700-\U0001f77f"
-    "\U0001f780-\U0001f7ff"
-    "\U0001f800-\U0001f8ff"
-    "\U0001f900-\U0001f9ff"
-    "\U0001fa00-\U0001faff"
-    "\U00002702-\U000027b0"
-    "\U000024c2-\U000024ff"
-    "\U00002600-\U000026ff"
+    "\U0001f1e6-\U0001f1ff"  # regional indicators (flags)
+    "\U0001f300-\U0001f5ff"  # misc symbols and pictographs
+    "\U0001f600-\U0001f64f"  # emoticons
+    "\U0001f680-\U0001f6ff"  # transport and map
+    "\U0001f700-\U0001f77f"  # alchemical symbols
+    "\U0001f780-\U0001f7ff"  # geometric extended
+    "\U0001f800-\U0001f8ff"  # supplemental arrows-C
+    "\U0001f900-\U0001f9ff"  # supplemental symbols and pictographs
+    "\U0001fa00-\U0001faff"  # symbols and pictographs extended-A
+    "\U00002702-\U000027b0"  # dingbats
+    "\U000024c2-\U000024ff"  # enclosed alphanumerics
+    "\U00002600-\U000026ff"  # misc symbols
+    "\U00002b00-\U00002bff"  # misc symbols and arrows (⭐ etc.)
     "]+",
     flags=re.UNICODE,
 )
@@ -252,18 +253,24 @@ def _build_font_chain(
     return chain
 
 
+def _is_emoji_char(ch: str) -> bool:
+    """判断字符是否属于 emoji 字符集（由 pilmoji 渲染成图片，不依赖字体字形）."""
+    return EMOJI_PATTERN.fullmatch(ch) is not None
+
+
 def _font_for_char(
-    ch: str, current: ImageFont.FreeTypeFont, chain: list[ImageFont.FreeTypeFont]
-) -> ImageFont.FreeTypeFont:
-    """返回链中第一个含该字符字形的字体；都没有则维持当前字体."""
+    ch: str, chain: list[ImageFont.FreeTypeFont]
+) -> ImageFont.FreeTypeFont | None:
+    """返回链中第一个含该字符字形的字体；全链缺失返回 None.
+
+    emoji 字符（pilmoji 负责渲染）即使无字形也返回主字体，不丢弃.
+    """
+    if _is_emoji_char(ch):
+        return chain[0] if chain else None
     for font in chain:
-        if font is current:
-            if _has_glyph(font, ch):
-                return font
-            continue
         if _has_glyph(font, ch):
             return font
-    return current
+    return None
 
 
 def _segment_by_font(
@@ -271,8 +278,9 @@ def _segment_by_font(
 ) -> list[tuple[ImageFont.FreeTypeFont, str]]:
     """按「哪个字体有该字符字形」把文本切分成 (font, segment) 序列.
 
-    主字体缺字形的字符（如韩文）切换到链中第一个有字形的字体，
-    全链都缺的字符保留在当前段（由 PIL 渲染 .notdef，与原行为一致）.
+    主字体缺字形的字符（如韩文）切换到链中第一个有字形的字体；
+    全链都缺字形且非 emoji 的字符（扩展 B 生僻字、未覆盖符号等）
+    直接丢弃，避免渲染成 .notdef 方块（issue #52 持续反馈的昵称 tofu 根源）.
     """
     if not chain:
         return []
@@ -281,7 +289,13 @@ def _segment_by_font(
     buf = ""
 
     for ch in text:
-        target_font = _font_for_char(ch, current_font, chain)
+        target_font = _font_for_char(ch, chain)
+        if target_font is None:
+            # 整条字体链都没有该字符字形且非 emoji：丢弃，不画方块
+            if buf:
+                segments.append((current_font, buf))
+                buf = ""
+            continue
         if target_font is not current_font and buf:
             segments.append((current_font, buf))
             buf = ""
