@@ -160,122 +160,141 @@ def load_font(
 
 # ---------------------------------------------------------------------------
 # 字符级字体回退（issue #52/#53：昵称含韩文等主字体不覆盖的字符时渲染 tofu）
+#
+# 实现：PIL getmask 签名对比（零外部依赖）。
+# 不用 fontTools 读 cmap：AstrBot 环境不保证安装 fontTools，
+# 且此前版本在 fontTools 缺失时字体链为空，导致昵称/头衔/正文全灭。
 # ---------------------------------------------------------------------------
 
-_cmap_cache: dict[str, set[int] | None] = {}
+# (font_path, size) -> {codepoint: 是否有真实字形}
+_glyph_support_cache: dict[tuple[str, int], dict[int, bool]] = {}
+# (font_path, size) -> .notdef mask 签名
+_notdef_sig_cache: dict[tuple[str, int], tuple | None] = {}
 
 
-def _get_cmap(font_path: Path) -> set[int] | None:
-    """读取字体文件的 cmap（带缓存）；读取失败返回 None 表示不可用作回退."""
-    key = str(font_path)
-    if key in _cmap_cache:
-        return _cmap_cache[key]
-    cmap: set[int] | None = None
-    if font_path.exists():
-        try:
-            from fontTools.ttLib import TTFont
+def _mask_signature(font: ImageFont.FreeTypeFont, ch: str):
+    """返回字体的 (mask尺寸, mask字节) 签名；失败返回 None."""
+    try:
+        mask = font.getmask(ch)
+        return (mask.size, bytes(mask))
+    except Exception:
+        return None
 
-            with TTFont(key, fontNumber=0, lazy=True) as tt:
-                cmap = set(tt.getBestCmap().keys())
-        except Exception as exc:
-            logger.warning("[say_picture] 读取字体 cmap 失败 %s: %s", key, exc)
-            cmap = None
-    _cmap_cache[key] = cmap
-    return cmap
+
+def _notdef_signature(font: ImageFont.FreeTypeFont):
+    key = (str(getattr(font, "path", "")), font.size)
+    if key in _notdef_sig_cache:
+        return _notdef_sig_cache[key]
+    sig = _mask_signature(font, "￿")
+    _notdef_sig_cache[key] = sig
+    return sig
+
+
+def _has_glyph(font: ImageFont.FreeTypeFont, ch: str) -> bool:
+    """判断字体是否含字符的真实字形（与 .notdef 对比；空白字符恒真）.
+
+    无法判定时保守返回 True（交给主字体画，维持原行为）.
+    """
+    if ch.isspace():
+        return True
+    key = (str(getattr(font, "path", "")), font.size)
+    cache = _glyph_support_cache.setdefault(key, {})
+    cp = ord(ch)
+    if cp in cache:
+        return cache[cp]
+
+    notdef = _notdef_signature(font)
+    if notdef is None:
+        # 连 .notdef 都取不到（异常字体），保守放行
+        cache[cp] = True
+        return True
+
+    sig = _mask_signature(font, ch)
+    result = sig is not None and sig != notdef
+    cache[cp] = result
+    return result
 
 
 def _build_font_chain(
     primary: ImageFont.FreeTypeFont,
-    bold: bool,
     fallback_paths: list[str] | None,
-) -> list[tuple[ImageFont.FreeTypeFont, set[int] | None]]:
-    """构造有序字体链 [(font, cmap)]：主字体在前，msyh 子集/韩文子集兜底."""
-    chain: list[tuple[ImageFont.FreeTypeFont, set[int] | None]] = []
-    seen_paths: set[str] = set()
+) -> list[ImageFont.FreeTypeFont]:
+    """构造有序字体链：主字体在前，内置 msyh/韩文子集与外部字体兜底.
 
-    def _add(font: ImageFont.FreeTypeFont, path: Path | None) -> None:
-        if path is None:
-            return
-        key = str(path)
-        if key in seen_paths:
-            return
-        cmap = _get_cmap(path)
-        if cmap:
-            chain.append((font, cmap))
-            seen_paths.add(key)
-
-    primary_path = getattr(primary, "path", None)
+    任何兜底字体加载失败都只跳过自身；链至少含主字体，
+    保证缺依赖/坏文件时退化为「全部主字体直绘」而非不绘制.
+    """
+    chain: list[ImageFont.FreeTypeFont] = [primary]
+    seen: set[str] = set()
+    primary_path = str(getattr(primary, "path", ""))
     if primary_path:
-        _add(primary, Path(primary_path))
+        seen.add(primary_path)
 
-    # 兜底 1: 内置 msyh 子集（CJK 基本区 + 假名 + 符号，CDN Noto 缺字形时补位）
-    msyh = Path(__file__).parent.parent / "fonts" / "msyh-subset.ttf"
-    if msyh.exists():
-        try:
-            _add(ImageFont.truetype(str(msyh), primary.size), msyh)
-        except Exception:
-            pass
-
-    # 兜底 2: 内置韩文子集（msyh 与 Noto Sans SC 均不含 Hangul）
-    if HANGUL_FONT_PATH.exists():
-        try:
-            _add(
-                ImageFont.truetype(str(HANGUL_FONT_PATH), primary.size),
-                HANGUL_FONT_PATH,
-            )
-        except Exception:
-            pass
-
+    candidates: list[Path] = [
+        # 兜底 1: 内置 msyh 子集（CJK 基本区 + 假名 + 符号）
+        Path(__file__).parent.parent / "fonts" / "msyh-subset.ttf",
+        # 兜底 2: 内置韩文子集（msyh 与 Noto Sans SC 均不含 Hangul）
+        HANGUL_FONT_PATH,
+    ]
     # 兜底 3: 调用方注入的外部字体
-    for path in fallback_paths or []:
-        p = Path(path)
-        if p.exists():
-            try:
-                _add(ImageFont.truetype(str(p), primary.size), p)
-            except Exception:
-                continue
+    candidates.extend(Path(p) for p in fallback_paths or [])
+
+    for path in candidates:
+        key = str(path)
+        if not path.exists() or key in seen:
+            continue
+        try:
+            chain.append(ImageFont.truetype(key, primary.size))
+            seen.add(key)
+        except Exception as exc:
+            logger.warning("[say_picture] 加载回退字体失败 %s: %s", key, exc)
 
     return chain
 
 
+def _font_for_char(
+    ch: str, current: ImageFont.FreeTypeFont, chain: list[ImageFont.FreeTypeFont]
+) -> ImageFont.FreeTypeFont:
+    """返回链中第一个含该字符字形的字体；都没有则维持当前字体."""
+    for font in chain:
+        if font is current:
+            if _has_glyph(font, ch):
+                return font
+            continue
+        if _has_glyph(font, ch):
+            return font
+    return current
+
+
 def _segment_by_font(
-    text: str, chain: list[tuple[ImageFont.FreeTypeFont, set[int] | None]]
+    text: str, chain: list[ImageFont.FreeTypeFont]
 ) -> list[tuple[ImageFont.FreeTypeFont, str]]:
     """按「哪个字体有该字符字形」把文本切分成 (font, segment) 序列.
 
     主字体缺字形的字符（如韩文）切换到链中第一个有字形的字体，
     全链都缺的字符保留在当前段（由 PIL 渲染 .notdef，与原行为一致）.
     """
+    if not chain:
+        return []
     segments: list[tuple[ImageFont.FreeTypeFont, str]] = []
-    current_font = chain[0][0] if chain else None
+    current_font = chain[0]
     buf = ""
 
     for ch in text:
-        cp = ord(ch)
-        target_font = current_font
-        for font, cmap in chain:
-            if cmap is None:
-                continue
-            if cp in cmap:
-                target_font = font
-                break
-        else:
-            # 无任何字体覆盖：保留在当前段
-            target_font = current_font
-
+        target_font = _font_for_char(ch, current_font, chain)
         if target_font is not current_font and buf:
             segments.append((current_font, buf))
             buf = ""
         current_font = target_font
         buf += ch
 
-    if buf and current_font is not None:
+    if buf:
         segments.append((current_font, buf))
     return segments
 
 
 def _measure_segmented(
-    text: str, chain: list[tuple[ImageFont.FreeTypeFont, set[int] | None]]
+    text: str, chain: list[ImageFont.FreeTypeFont]
 ) -> tuple[int, int]:
     """按分段字体测量文本 bbox 宽高（用于昵称宽度测量）."""
     total_w = 0
@@ -352,7 +371,7 @@ def _draw_text(
     fallback_paths: list[str] | None = None,
 ) -> None:
     # 字符级回退：主字体缺字形的字符（如韩文）用后备字体补画
-    chain = _build_font_chain(font, bold=False, fallback_paths=fallback_paths)
+    chain = _build_font_chain(font, fallback_paths=fallback_paths)
 
     pilmoji_class = _get_pilmoji_class()
     x, y = position
@@ -490,9 +509,7 @@ def render_chat_screenshot(
 
     name_font = load_font(name_font_size, bold=False, fallback_paths=fallback_paths)
     # 字符级回退测量：昵称可能含主字体缺字形的字符（韩文等），逐段取宽
-    _name_chain = _build_font_chain(
-        name_font, bold=False, fallback_paths=fallback_paths
-    )
+    _name_chain = _build_font_chain(name_font, fallback_paths=fallback_paths)
     name_w, name_h = _measure_segmented(safe_name, _name_chain)
 
     label_img = None
