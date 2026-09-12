@@ -9,6 +9,7 @@ import importlib
 import io
 import random
 import re
+import unicodedata
 from pathlib import Path
 
 from astrbot.api import logger
@@ -313,7 +314,10 @@ def _measure_segmented(
     """按分段字体测量文本 bbox 宽高（用于昵称宽度测量）."""
     total_w = 0
     max_h = 0
-    for font, seg in _segment_by_font(text, chain):
+    segments = _segment_by_font(text, chain)
+    if not segments and text.strip():
+        segments = [(chain[0], text)] if chain else []
+    for font, seg in segments:
         bbox = font.getbbox(seg)
         if bbox:
             total_w += bbox[2] - bbox[0]
@@ -327,8 +331,25 @@ def get_bundled_fallback_paths() -> list[str]:
     return [str(bundled)]
 
 
+def make_placeholder_avatar(size: int = 135) -> bytes:
+    """生成占位头像（纯色圆）。
+
+    issue #61：QQ 官方机器人等平台拿不到 OneBot 头像接口 / QLogo CDN（openid 非数字 QQ 号），
+    用占位头像保证渲染流程不中断，仍能出图。
+    """
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((0, 0, size, size), fill=(150, 160, 180, 255))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def sanitize_display_text(text: str, preserve_emoji: bool = False) -> str:
     cleaned = str(text or "")
+    # issue #59：NFKC 把花体/全角/数学字母等兼容字符归一为字体可覆盖的基础形，
+    # 避免昵称整串特殊符号在字体链中无字形而被丢弃成空白。
+    cleaned = unicodedata.normalize("NFKC", cleaned)
     cleaned = FACE_PLACEHOLDER_PATTERN.sub("", cleaned)
     if not preserve_emoji:
         cleaned = EMOJI_PATTERN.sub("", cleaned)
@@ -390,10 +411,15 @@ def _draw_text(
     pilmoji_class = _get_pilmoji_class()
     x, y = position
 
+    segments = _segment_by_font(text, chain)
+    if not segments and text.strip() and chain:
+        # issue #59：整串字符全链无字形时不再留空，回退主字体直绘（宁 tofu 不空白）
+        segments = [(chain[0], text)]
+
     if pilmoji_class:
         # pilmoji 有完整 emoji 渲染；仍按字符级回退分段，逐段交给 pilmoji
         try:
-            for seg_font, seg in _segment_by_font(text, chain):
+            for seg_font, seg in segments:
                 with pilmoji_class(
                     image, emoji_position_offset=(0, emoji_offset_y)
                 ) as pilmoji:
@@ -407,7 +433,7 @@ def _draw_text(
             logger.warning("[say_picture] pilmoji 渲染失败，回退纯文本: %s", exc)
 
     draw = ImageDraw.Draw(image)
-    for seg_font, seg in _segment_by_font(text, chain):
+    for seg_font, seg in segments:
         draw.text((x, y), seg, font=seg_font, fill=fill)
         bbox = seg_font.getbbox(seg)
         x += (bbox[2] - bbox[0]) if bbox else 0
@@ -498,12 +524,14 @@ def render_chat_screenshot(
     max_text_width: int = 900,
     name_font_size: int = 35,
     label_font_size: int = 32,
+    bubble_y: int = 72,
     fallback_paths: list[str] | None = None,
 ) -> bytes:
     """渲染完整聊天截图（昵称 + LV 徽章 + 头衔 + 气泡 + 头像）。
 
     anti_revoke 默认参数为 55/900/35/32；say_picture 调用时传
     26/480/20/18 以保持原有排版（issue #47 "图片不变"约束）。
+    bubble_y: 聊天框顶部 y 坐标（issue #60 上移；框内文字随框一起移动）。
     """
     try:
         avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
@@ -657,10 +685,10 @@ def render_chat_screenshot(
     name_x = badge_x + label_w + 10 if show_title and label_img else badge_x
 
     canvas_w = max(name_x + name_w, bubble_x + box_img.width) + 50
-    canvas_h = box_img.height + 110
+    canvas_h = box_img.height + bubble_y + 28
     canvas = Image.new("RGBA", (int(canvas_w), int(canvas_h)), "#eaedf4")
     canvas.paste(avatar, (20, 20), mask=avatar)
-    canvas.paste(box_img, (bubble_x, 82), mask=box_img)
+    canvas.paste(box_img, (bubble_x, bubble_y), mask=box_img)
     if show_title and label_img:
         canvas.paste(label_img, (badge_x, 25), mask=label_img)
 
