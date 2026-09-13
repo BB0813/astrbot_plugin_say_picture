@@ -69,18 +69,29 @@ class MentionSayPlugin(Star):
         group_id = event.get_group_id()
         if bot is not None and group_id and hasattr(bot, "call_action"):
             try:
-                info = (
-                    await bot.call_action(
-                        "get_group_member_info",
-                        group_id=int(group_id),
-                        user_id=int(mentioned_user_id),
-                        no_cache=True,
-                    )
-                    or {}
+                gid_int = int(group_id)
+                uid_int = int(mentioned_user_id)
+            except ValueError:
+                # review #62：官方机器人 openid 非数字，明确分类日志，不与 call_action 失败混淆
+                print(
+                    f"[mention_say] group_id/user_id 非数字（官方机器人 openid 形态），"
+                    f"跳过 OneBot 成员信息: gid={group_id!r} uid={mentioned_user_id!r}"
                 )
-            except Exception as e:
-                print(f"[mention_say] 获取群成员信息失败（可能非 OneBot 平台）: {e}")
-                info = {}
+                gid_int = uid_int = None
+            if gid_int is not None:
+                try:
+                    info = (
+                        await bot.call_action(
+                            "get_group_member_info",
+                            group_id=gid_int,
+                            user_id=uid_int,
+                            no_cache=True,
+                        )
+                        or {}
+                    )
+                except Exception as e:
+                    print(f"[mention_say] 获取群成员信息失败（可能非 OneBot 平台）: {e}")
+                    info = {}
         return {
             "role": info.get("role", "member"),
             "level": int(info.get("level", 0) or 0),
@@ -89,15 +100,9 @@ class MentionSayPlugin(Star):
             "avatar": info.get("avatar") or "",
         }
 
-    async def _fetch_avatar(
-        self, mentioned_user_id: str, member_info: dict[str, Any]
-    ) -> bytes | None:
-        """头像：成员信息 avatar → QLogo CDN（仅数字 QQ 号）→ None（调用方占位）."""
-        urls: list[str] = []
-        if member_info.get("avatar"):
-            urls.append(member_info["avatar"])
-        if mentioned_user_id.isdigit():
-            urls.append(f"https://q1.qlogo.cn/g?b=qq&nk={mentioned_user_id}&s=640")
+    @staticmethod
+    def _fetch_avatar_sync(urls: list[str]) -> bytes | None:
+        """同步顺序拉取头像；经线程池调用避免阻塞事件循环（review #62 sync-in-async）."""
         for url in urls:
             try:
                 with urllib.request.urlopen(url, timeout=10) as resp:
@@ -105,6 +110,26 @@ class MentionSayPlugin(Star):
             except Exception as e:
                 print(f"[mention_say] 获取头像失败 {url}: {e}")
         return None
+
+    async def _fetch_avatar(
+        self, mentioned_user_id: str, member_info: dict[str, Any]
+    ) -> bytes | None:
+        """头像：成员信息 avatar(仅 http(s)) → QLogo CDN(仅数字 QQ) → None(调用方占位)."""
+        urls: list[str] = []
+        avatar_field = str(member_info.get("avatar") or "")
+        if avatar_field:
+            if avatar_field.startswith(("http://", "https://")):
+                urls.append(avatar_field)
+            else:
+                # review #62 ssrf：avatar 字段可能为相对路径/base64/非 http(s) 协议，跳过并走兜底
+                print(f"[mention_say] 跳过非 http(s) avatar 字段: {avatar_field[:64]!r}")
+        if mentioned_user_id.isdigit():
+            urls.append(f"https://q1.qlogo.cn/g?b=qq&nk={mentioned_user_id}&s=640")
+        if not urls:
+            return None
+        import asyncio
+
+        return await asyncio.to_thread(self._fetch_avatar_sync, urls)
 
     @filter.regex(r"说[\s～]")
     async def on_mention_say(self, event: AstrMessageEvent):

@@ -331,17 +331,24 @@ def get_bundled_fallback_paths() -> list[str]:
     return [str(bundled)]
 
 
+_placeholder_avatar_cache: dict[int, bytes] = {}
+
+
 def make_placeholder_avatar(size: int = 135) -> bytes:
     """生成占位头像（纯色圆）。
 
     issue #61：QQ 官方机器人等平台拿不到 OneBot 头像接口 / QLogo CDN（openid 非数字 QQ 号），
     用占位头像保证渲染流程不中断，仍能出图。
+    review #62：按 size 缓存生成结果，避免同会话内重复编码 PNG。
     """
+    if size in _placeholder_avatar_cache:
+        return _placeholder_avatar_cache[size]
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse((0, 0, size, size), fill=(150, 160, 180, 255))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
+    _placeholder_avatar_cache[size] = buf.getvalue()
     return buf.getvalue()
 
 
