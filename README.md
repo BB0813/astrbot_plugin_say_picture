@@ -2,7 +2,7 @@
 
 当检测到群消息中 **@某人 说～xxx**（或 **@某人 说 xxx**）格式时，自动生成聊天气泡表情包并发送。「说」后必须有分隔符（空格或～）。
 
-基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 框架开发，兼容 OneBot v11 标准。
+基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 框架开发，兼容 OneBot v11 标准；在 QQ 官方机器人等非 OneBot 平台会优雅降级（见「平台兼容」）。
 
 ---
 
@@ -77,8 +77,19 @@ PIL 渲染生成聊天气泡图片（圆形头像 + 气泡 + LV100标签）
 |------|------|
 | 图片渲染 | PIL (Pillow) |
 | 中文字体 | 插件内置微软雅黑子集 / 系统字体 / 网络下载 Noto Sans SC |
-| 头像获取 | OneBot `get_group_member_info` → 失败则用 `q1.qlogo.cn` |
+| 头像获取 | OneBot `get_group_member_info` → `q1.qlogo.cn`（仅数字 QQ）→ 占位头像兜底 |
 | 输出格式 | RGBA PNG |
+
+### 平台兼容（issue #61）
+
+渲染与发送走 AstrBot 通用消息接口，跨平台可用；仅「群成员信息（头像/昵称/等级/头衔）」依赖 OneBot，非 OneBot 平台优雅降级：
+
+| 平台 | 头像 | 昵称 / 等级 / 头衔 |
+|------|------|--------------------|
+| OneBot v11（aiocqhttp 等） | 成员信息 avatar → QLogo CDN | 完整（card/nickname/level/title） |
+| QQ 官方机器人等 | 占位头像（纯色圆） | 昵称回退 `用户<id>`，等级 LV0、无头衔 |
+
+即在官方机器人上仍能正常出图，只是头像为占位圆、等级/头衔为默认值。
 
 ---
 

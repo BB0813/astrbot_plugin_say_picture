@@ -10,6 +10,7 @@ from astrbot.api.star import StarTools
 from .rendering.chat_screenshot import (
     render_chat_screenshot,
     get_bundled_fallback_paths,
+    make_placeholder_avatar,
     set_font_dir,  # noqa: F401  (仅供测试确认导入路径可用)
     set_font_manager,
 )
@@ -54,6 +55,81 @@ class MentionSayPlugin(Star):
                 set_font_dir(self._font_manager.font_dir)
         except Exception as e:
             print(f"[mention_say] 字体后台下载失败（使用内置字体兜底）: {e}")
+
+    async def _resolve_member_info(
+        self, event: AstrMessageEvent, mentioned_user_id: str
+    ) -> dict[str, Any]:
+        """群成员信息：OneBot get_group_member_info 优先；非 OneBot 平台/失败回退默认值。
+
+        issue #61：QQ 官方机器人等平台的 id 为 openid（非数字）、client 无 call_action，
+        这里统一吞掉异常并返回默认成员信息，保证渲染流程继续。
+        """
+        info: dict[str, Any] = {}
+        bot = getattr(event, "bot", None)
+        group_id = event.get_group_id()
+        if bot is not None and group_id and hasattr(bot, "call_action"):
+            try:
+                gid_int = int(group_id)
+                uid_int = int(mentioned_user_id)
+            except ValueError:
+                # review #62：官方机器人 openid 非数字，明确分类日志，不与 call_action 失败混淆
+                print(
+                    f"[mention_say] group_id/user_id 非数字（官方机器人 openid 形态），"
+                    f"跳过 OneBot 成员信息: gid={group_id!r} uid={mentioned_user_id!r}"
+                )
+                gid_int = uid_int = None
+            if gid_int is not None:
+                try:
+                    info = (
+                        await bot.call_action(
+                            "get_group_member_info",
+                            group_id=gid_int,
+                            user_id=uid_int,
+                            no_cache=True,
+                        )
+                        or {}
+                    )
+                except Exception as e:
+                    print(f"[mention_say] 获取群成员信息失败（可能非 OneBot 平台）: {e}")
+                    info = {}
+        return {
+            "role": info.get("role", "member"),
+            "level": int(info.get("level", 0) or 0),
+            "title": info.get("title", "") or "",
+            "nickname": info.get("card") or info.get("nickname") or "",
+            "avatar": info.get("avatar") or "",
+        }
+
+    @staticmethod
+    def _fetch_avatar_sync(urls: list[str]) -> bytes | None:
+        """同步顺序拉取头像；经线程池调用避免阻塞事件循环（review #62 sync-in-async）."""
+        for url in urls:
+            try:
+                with urllib.request.urlopen(url, timeout=10) as resp:
+                    return resp.read()
+            except Exception as e:
+                print(f"[mention_say] 获取头像失败 {url}: {e}")
+        return None
+
+    async def _fetch_avatar(
+        self, mentioned_user_id: str, member_info: dict[str, Any]
+    ) -> bytes | None:
+        """头像：成员信息 avatar(仅 http(s)) → QLogo CDN(仅数字 QQ) → None(调用方占位)."""
+        urls: list[str] = []
+        avatar_field = str(member_info.get("avatar") or "")
+        if avatar_field:
+            if avatar_field.startswith(("http://", "https://")):
+                urls.append(avatar_field)
+            else:
+                # review #62 ssrf：avatar 字段可能为相对路径/base64/非 http(s) 协议，跳过并走兜底
+                print(f"[mention_say] 跳过非 http(s) avatar 字段: {avatar_field[:64]!r}")
+        if mentioned_user_id.isdigit():
+            urls.append(f"https://q1.qlogo.cn/g?b=qq&nk={mentioned_user_id}&s=640")
+        if not urls:
+            return None
+        import asyncio
+
+        return await asyncio.to_thread(self._fetch_avatar_sync, urls)
 
     @filter.regex(r"说[\s～]")
     async def on_mention_say(self, event: AstrMessageEvent):
@@ -106,50 +182,20 @@ class MentionSayPlugin(Star):
         print(f"[mention_say] mentioned_user_id: {mentioned_user_id}")
         print(f"[mention_say] say_content: {say_content}")
 
-        # ---- 获取头像 + 群成员信息 ----
-        avatar_bytes: bytes | None = None
-        member_info: dict[str, Any] = {}
-        try:
-            bot = getattr(event, "bot", None)
-            if bot is not None and event.get_group_id():
-                try:
-                    member_info = await bot.call_action(
-                        "get_group_member_info",
-                        group_id=int(event.get_group_id()),
-                        user_id=int(mentioned_user_id),
-                        no_cache=True,
-                    )
-                    avatar_url = member_info.get("avatar")
-                except Exception:
-                    avatar_url = None
-
-                if not avatar_url:
-                    avatar_url = (
-                        f"https://q1.qlogo.cn/g?b=qq&nk={mentioned_user_id}&s=640"
-                    )
-
-                with urllib.request.urlopen(avatar_url, timeout=10) as resp:
-                    avatar_bytes = resp.read()
-        except Exception as e:
-            print(f"[mention_say] 获取头像失败: {e}")
-
+        # ---- 获取头像 + 群成员信息（跨平台：OneBot 优先，官方机器人等优雅回退）----
+        member_info = await self._resolve_member_info(event, mentioned_user_id)
+        avatar_bytes = await self._fetch_avatar(mentioned_user_id, member_info)
         if avatar_bytes is None:
-            yield event.plain_result(
-                f"未找到用户 {mentioned_user_id} 的头像信息，"
-                f"但表情包内容是：{say_content}"
-            )
-            return
+            # issue #61：QQ 官方机器人等平台无 OneBot 头像接口、openid 也无法走 QLogo CDN，
+            # 用占位头像继续渲染，而不是放弃出图。
+            avatar_bytes = make_placeholder_avatar()
 
         # ---- 渲染（方案 A：anti_revoke 聊天截图格式，保留原排版参数）----
         try:
-            name = (
-                member_info.get("card")
-                or member_info.get("nickname")
-                or f"用户{mentioned_user_id}"
-            )
+            name = member_info.get("nickname") or f"用户{mentioned_user_id}"
             role = member_info.get("role", "member")
-            level = int(member_info.get("level", 0) or 0)
-            title = member_info.get("title", "") or ""
+            level = member_info.get("level", 0)
+            title = member_info.get("title", "")
             # 调试：打印昵称/头衔码点，用于定位渲染 tofu 的确切字符
             print(
                 f"[mention_say] name codepoints: "
