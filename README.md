@@ -15,12 +15,12 @@
 @某人 说 今天天气真好
 ```
 
-机器人将生成一张聊天气泡表情包：
+机器人将生成一张聊天截图表情包：
 
-- 🧑 圆形头像 + 白色边框
-- 💬 白色聊天气泡 + 三角指向头像
-- 🏷️ "LV100" 等级标签
-- ✍️ 气泡内显示你说的话
+- 🧑 圆形头像
+- 🏷️ 等级徽章（LV<等级>）+ 群头衔（群主/管理员/段位或自定义头衔），底色随身份变化
+- ✍️ 昵称（徽章右侧；归一化 + 字体回退，花体/特殊符号也不会空白，#59）
+- 💬 白色聊天气泡（位置上移、文字随气泡跟随，#60），气泡内显示你说的话
 
 ---
 
@@ -64,21 +64,21 @@ git clone https://github.com/mjy1113451/astrbot_plugin_say_picture.git
     ↓
 插件拦截消息链，提取 At 组件 + "说" 分隔符后面的文字
     ↓
-通过 OneBot API 获取被 @ 用户的头像
+跨平台身份解析：OneBot get_group_member_info → QLogo CDN（仅数字 QQ）→ 占位头像（线程池异步拉取）
     ↓
-PIL 渲染生成聊天气泡图片（圆形头像 + 气泡 + LV100标签）
+PIL 渲染聊天截图（圆形头像 + 昵称 + LV 徽章/群头衔 + 气泡）
     ↓
-以图片消息形式发送回聊天
+以图片消息形式发送回聊天（通用 result 接口，跨平台）
 ```
 
 ### 技术细节
 
 | 项目 | 说明 |
 |------|------|
-| 图片渲染 | PIL (Pillow) |
-| 中文字体 | 插件内置微软雅黑子集 / 系统字体 / 网络下载 Noto Sans SC |
-| 头像获取 | OneBot `get_group_member_info` → `q1.qlogo.cn`（仅数字 QQ）→ 占位头像兜底 |
-| 输出格式 | RGBA PNG |
+| 图片渲染 | PIL (Pillow)，`rendering/` 包（chat_screenshot / font_manager） |
+| 中文字体 | CDN 下载 Noto Sans SC（manifest SHA256 校验）→ 内置 msyh/韩文子集字符级回退；NFKC 归一化 + 空段回退保证昵称不空白（#59） |
+| 头像获取 | OneBot `get_group_member_info` → `q1.qlogo.cn`（仅数字 QQ、http(s) 协议校验）→ 占位头像兜底；线程池异步拉取不阻塞事件循环 |
+| 输出格式 | JPEG（quality 90） |
 
 ### 平台兼容（issue #61）
 
@@ -98,13 +98,19 @@ PIL 渲染生成聊天气泡图片（圆形头像 + 气泡 + LV100标签）
 ```
 astrbot_plugin_say_picture/
 ├── fonts/
-│   └── msyh-subset.ttf      # 内置中文字体（微软雅黑子集）
-├── .sakura/                  # Sakura 配置（AstrBot 模板）
+│   ├── msyh-subset.ttf       # 内置中文字体（微软雅黑子集）
+│   └── hangul-subset.ttf     # 内置韩文子集（字符级回退 #52）
+├── rendering/
+│   ├── __init__.py
+│   ├── chat_screenshot.py    # 聊天截图渲染（昵称/LV 徽章/头衔/气泡）
+│   └── font_manager.py       # 字体 CDN 下载（manifest SHA256 校验）
+├── resources/
+│   └── corner1.png ~ corner4.png  # 气泡圆角素材
 ├── .gitignore
 ├── _conf_schema.json          # 配置 schema
 ├── config.json               # 插件配置
 ├── LICENSE                   # AGPL-3.0
-├── main.py                   # 插件主逻辑
+├── main.py                   # 插件主逻辑（触发/身份解析/发送）
 ├── metadata.yaml             # 插件元信息
 └── README.md
 ```
